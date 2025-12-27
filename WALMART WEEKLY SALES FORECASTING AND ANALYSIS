@@ -1,0 +1,382 @@
+#========================================================
+# 1. Load all necessary libraries
+#========================================================
+library(tidyverse)
+library(lubridate)
+library(fpp3)
+library(forecast)
+library(prophet)
+library(xgboost)
+library(Metrics)
+library(shiny)
+library(DT)
+library(bslib)
+library(scales)
+library(corrplot)
+
+#========================================================
+# 2. Load and clean data
+#========================================================
+walmart_data <- read.csv(file.choose())
+
+#Clean Data
+data_clean <- walmart_data %>%
+  mutate(
+    Date = if(is.character(Date)) dmy(Date) else as.Date(Date),
+    Store = as.factor(Store),
+    Holiday_Flag = as.numeric(Holiday_Flag) ) %>%
+  arrange(Store, Date)
+
+#head(walmart_data)
+#tail(walmart_data)
+#str(walmart_data)
+#summary(walmart_data)
+
+# Check total missing values
+#sum(is.na(walmart_data))
+
+# Check missing values by column
+#colSums(is.na(walmart_data))
+
+# Number of duplicate rows
+#sum(duplicated(walmart_data))
+
+# View duplicate rows (if any)
+#walmart_data[duplicated(walmart_data), ]
+
+
+#========================================================
+# 3. Create forecast function
+#========================================================
+
+# --- Add holiday information
+walmart_holidays <- function(dates) {
+  sapply(dates, function(date) {
+    y <- year(date); m <- month(date); d <- day(date); w <- wday(date, week_start=1)
+    is_holiday <- (m==2 & w==1 & d>=15 & d<=21) | # Super Bowl / Pres Day
+                  (m==11 & w==5 & d>=23 & d<=29) | # Black Friday
+                  (m==12 & d>=20 & d<=31) |        # Xmas
+                  (m==11 & w==4 & d>=22 & d<=28)   # Thanksgiving
+    as.integer(is_holiday) })}
+
+# --- Create Forecast
+forecast_store_validation <- function(df_store, h_future = 65) {
+  
+# 1.Prepare Data
+df_ts <- df_store %>%
+as_tsibble(index = Date) %>%
+fill_gaps() %>%
+mutate(
+Weekly_Sales = ifelse(is.na(Weekly_Sales), median(Weekly_Sales, na.rm = TRUE), Weekly_Sales),
+Lag_52 = lag(Weekly_Sales, 52),
+Trend = as.numeric(Date))
+
+# 2.Validation Split
+holdout <- 12
+train_split <- df_ts %>% slice(1:(n()-holdout))
+test_split <- df_ts %>% slice_tail(n=holdout)
+
+#--- PART A: Test Models
+
+#Models: ETS & ARIMAX
+fit_fable <- train_split %>% model(
+ETS = ETS(Weekly_Sales),
+ARIMAX = ARIMA(Weekly_Sales ~ Holiday_Flag))
+fc_fable <- fit_fable %>% forecast(new_data = test_split) %>% as_tibble()
+
+#Model: TBATS
+fit_tbats <- tbats(train_split$Weekly_Sales, seasonal.periods=52.18)
+fc_tbats <- forecast(fit_tbats, h=holdout)$mean
+
+#Model: Prophet
+p_train <- train_split %>% as_tibble() %>% select(Date, Weekly_Sales) %>% rename(ds=Date, y=Weekly_Sales)
+m <- prophet(daily.seasonality=FALSE, weekly.seasonality=TRUE, yearly.seasonality=TRUE)
+m <- add_country_holidays(m, country_name='US')
+m <- fit.prophet(m, p_train)
+future_cv <- make_future_dataframe(m, periods=holdout, freq="week")
+fc_prophet <- tail(predict(m, future_cv)$yhat, holdout)
+
+#Model: XGBoost
+train_aug <- train_split %>% drop_na(Lag_52)
+test_aug <- test_split %>%
+mutate(Lag_52 = train_split$Weekly_Sales[match(Date-weeks(52), train_split$Date)],
+Trend = as.numeric(Date))
+
+feats <- c("Holiday_Flag", "Lag_52", "Trend")
+#Convert to tibble first to strip tsibble attributes
+X_tr <- as.matrix(train_aug %>% as_tibble() %>% select(all_of(feats)))
+y_tr <- train_aug$Weekly_Sales
+X_te <- as.matrix(test_aug %>% as_tibble() %>% select(all_of(feats)))
+
+xgb_mod <- xgboost(data=X_tr, label=y_tr, nrounds=100, objective="reg:squarederror", verbose=0)
+fc_xgb <- predict(xgb_mod, X_te)
+
+# Accuracy Metrics
+eval_df <- bind_rows(
+fc_fable %>% select(Date, .model, .mean) %>% rename(Model=.model, Forecast=.mean),
+tibble(Date=test_split$Date, Model="TBATS", Forecast=as.numeric(fc_tbats)),
+tibble(Date=test_split$Date, Model="Prophet", Forecast=fc_prophet),
+tibble(Date=test_split$Date, Model="XGBoost", Forecast=fc_xgb)
+) %>% left_join(test_split %>% select(Date, Actual=Weekly_Sales), by="Date")
+
+evaluation_table <- eval_df %>%
+group_by(Model) %>%
+summarise(
+RMSE = round(rmse(Actual, Forecast), 0),
+MAPE = round(mape(Actual, Forecast)*100, 2)
+) %>%
+arrange(RMSE)
+
+
+#--- Part B: Create Forecast
+
+future_dates <- seq(max(df_ts$Date)+weeks(1), by="week", length.out=h_future)
+future_base <- tibble(Date = future_dates) %>%
+mutate(
+Holiday_Flag = walmart_holidays(Date),
+# Naive lag fill for future base structure
+Lag_52 = df_ts$Weekly_Sales[match(Date-weeks(52), df_ts$Date)],
+Trend = as.numeric(Date)
+) %>% as_tsibble(index=Date)
+
+
+# 1. ETS & ARIMAX
+fit_fable_full <- df_ts %>% model(
+ETS = ETS(Weekly_Sales),
+ARIMAX = ARIMA(Weekly_Sales ~ Holiday_Flag))
+
+fc_fable_full <- fit_fable_full %>% forecast(new_data = future_base) %>% as_tibble() %>%
+select(Date, .model, .mean) %>% rename(Model=.model, Forecast=.mean)
+
+# 2. TBATS
+fit_tbats_full <- tbats(df_ts$Weekly_Sales, seasonal.periods=52.18)
+fc_tbats_full <- forecast(fit_tbats_full, h=h_future)$mean
+
+# 3. Prophet
+p_full <- df_ts %>% as_tibble() %>% select(Date, Weekly_Sales) %>% rename(ds=Date, y=Weekly_Sales)
+m_full <- prophet(daily.seasonality=FALSE, weekly.seasonality=TRUE, yearly.seasonality=TRUE)
+m_full <- add_country_holidays(m_full, country_name='US')
+m_full <- fit.prophet(m_full, p_full)
+future_p <- make_future_dataframe(m_full, periods=h_future, freq="week")
+fc_prophet_full <- tail(predict(m_full, future_p)$yhat, h_future)
+
+# 4. XGBoost (Recursive loops to avoid plot flot at end of forecast)
+train_aug_full <- df_ts %>% drop_na(Lag_52)
+X_tr_full <- as.matrix(train_aug_full %>% as_tibble() %>% select(all_of(feats)))
+y_tr_full <- train_aug_full$Weekly_Sales
+
+xgb_mod_full <- xgboost(data=X_tr_full, label=y_tr_full, nrounds=100, objective="reg:squarederror", verbose=0)
+
+fc_xgb_full <- numeric(h_future)
+history_sales <- df_ts$Weekly_Sales
+
+for(i in 1:h_future) {
+curr_date <- future_dates[i]
+# Grab actual history if available, else grab predicted history
+lag_val <- history_sales[length(history_sales) + 1 - 52]
+
+curr_feat <- tibble(
+Holiday_Flag = walmart_holidays(curr_date),
+Lag_52 = lag_val,
+Trend = as.numeric(curr_date)
+) %>% select(all_of(feats)) %>% as.matrix()
+
+pred_val <- predict(xgb_mod_full, curr_feat)
+fc_xgb_full[i] <- pred_val
+history_sales <- c(history_sales, pred_val)}
+
+
+forecast_df <- bind_rows(
+fc_fable_full,
+tibble(Date=future_dates, Forecast=as.numeric(fc_prophet_full), Model="Prophet"),
+tibble(Date=future_dates, Forecast=as.numeric(fc_tbats_full), Model="TBATS"),
+tibble(Date=future_dates, Forecast=as.numeric(fc_xgb_full), Model="XGBoost"))
+
+
+list(evaluation = evaluation_table, forecast = forecast_df, actual = df_ts)}
+
+#========================================================
+# 4. Shiny UI
+#=======================================================
+ui <- fluidPage(
+theme = bs_theme(bootswatch = "flatly"),
+titlePanel("Walmart Sales Forecast Analysis"),
+sidebarLayout(
+sidebarPanel(
+h4("Configuration"),
+# Select Store (Added "All" option)
+selectInput("store_select", "Select Store:",
+choices = c("All", sort(unique(data_clean$Store)))),
+hr(),
+h5("Model Accuracy (Validation)"),
+p("Performance on last 12 weeks of data:", style="font-size:0.9em; color:grey;"),
+tableOutput("accuracyTable"),
+hr(),
+downloadButton("downloadForecast", "Download CSV")),
+
+mainPanel(
+tabsetPanel(
+# Tab 1: EDA
+tabPanel("1. EDA & Correlation",
+br(),
+h4("Exploratory Data Analysis"),
+plotOutput("eda_plot", height = "600px"),
+br(),
+h4("Correlation Matrix"),
+p("Correlation between Sales and External Factors"),
+plotOutput("corr_plot", height = "600px")),
+
+# Tab 2: Decomposition
+tabPanel("2. Decomposition",
+br(),
+h4("Time Series Decomposition (STL)"),
+p("Breaking down sales into Trend, Seasonality, and Noise."),
+plotOutput("decomp_plot", height = "600px")),
+
+# Tab 3: Forecast
+tabPanel("3. Forecast Results",
+br(),
+h4("Sales Projection (65 Weeks)"),
+plotOutput("forecastPlot", height = "500px"),
+br(),
+h4("Detailed Forecast Numbers"),
+DTOutput("dataTable"))))))
+
+#========================================================
+# 5. SHINY SERVER
+#========================================================
+server <- function(input, output, session) {
+# Reactive: Filter OR Aggregate Data
+store_data_raw <- reactive({
+req(input$store_select)
+if(input$store_select == "All") {
+# AGGREGATE LOGIC: Sum sales, average others
+data_clean %>%
+group_by(Date) %>%
+summarise(
+Weekly_Sales = sum(Weekly_Sales, na.rm = TRUE),
+Holiday_Flag = max(Holiday_Flag, na.rm = TRUE),
+Temperature = mean(Temperature, na.rm = TRUE),
+Fuel_Price = mean(Fuel_Price, na.rm = TRUE),
+CPI = mean(CPI, na.rm = TRUE),
+Unemployment = mean(Unemployment, na.rm = TRUE),
+.groups = "drop") %>%
+arrange(Date)} 
+else {
+# SINGLE STORE LOGIC
+data_clean %>%
+filter(Store == input$store_select)}})
+# Reactive: Run Forecast (Only runs when data changes)
+store_results <- reactive({
+req(store_data_raw())
+msg_text <- if(input$store_select == "All") "Global Sales" else paste("Store", input$store_select)
+withProgress(message = paste('Processing', msg_text, '...'), value = 0, {
+incProgress(0.2, detail = "Training Models...")
+res <- forecast_store_validation(store_data_raw(), h_future = 65)
+incProgress(0.8, detail = "Finalizing...")
+res})})
+
+#---Output: Accuracy Table
+output$accuracyTable <- renderTable({
+req(store_results())
+store_results()$evaluation %>%
+mutate(RMSE = comma(RMSE, accuracy = 1), MAPE = paste0(sprintf("%.2f", MAPE), "%"))}, align = "r")
+
+#---Output: Forecast Plot
+output$forecastPlot <- renderPlot({
+req(store_results())
+res <- store_results()
+actual_data <- res$actual %>% as_tibble()
+forecast_data <- res$forecast %>% as_tibble()
+plot_start_date <- max(actual_data$Date) - weeks(104) # Show last 2 years context
+ggplot() +
+geom_line(data = actual_data %>% filter(Date > plot_start_date),
+aes(x = Date, y = Weekly_Sales, color = "History"), size = 1) +
+geom_line(data = forecast_data,
+aes(x = Date, y = Forecast, color = Model), size = 0.8) +
+geom_vline(xintercept = min(forecast_data$Date), linetype="dashed", color="gray") +
+scale_color_manual(values = c("History"="#333333", "Prophet"="#009E73", "TBATS"="#0072B2", "ETS"="#E69F00", "ARIMAX"="#D55E00", "XGBoost"="#CC79A7")) +
+scale_y_continuous(labels = label_number(scale_cut = cut_short_scale())) +
+labs(title = NULL, x = "Date", y = "Weekly Sales") +
+theme_minimal(base_size = 14) + theme(legend.position="bottom")})
+
+#---Output: Data Table
+output$dataTable <- renderDT({
+req(store_results())
+df <- store_results()$forecast %>% pivot_wider(names_from = Model, values_from = Forecast)
+datatable(df, options = list(pageLength = 10)) %>% formatCurrency(columns = names(df)[-1], currency = "", digits = 0)})
+
+#---Output: Download
+output$downloadForecast <- downloadHandler(
+filename = function() { paste0("Forecast_", input$store_select, ".csv") },
+content = function(file) { write.csv(store_results()$forecast, file, row.names = FALSE) })
+
+#--- Output: EDA Plots
+output$eda_plot <- renderPlot({
+req(store_data_raw())
+df <- store_data_raw()
+# Store old parameters
+oldpar <- par(no.readonly = TRUE)
+on.exit(par(oldpar))
+par(mfrow=c(2,2), mar=c(4,4,2,1))
+# 1. Weekly Sales
+plot(df$Date, df$Weekly_Sales, type="l", main="Sales Trend", xlab="Date", ylab="Sales", col="#2C3E50")
+# 2. Monthly Seasonality
+monthly <- df %>% mutate(M = month(Date, label=TRUE)) %>% group_by(M) %>% summarise(S=mean(Weekly_Sales, na.rm=T))
+plot(monthly$M, monthly$S, type="b", main="Avg Monthly Sales", xlab="Month", ylab="Sales", pch=19, col="#E67E22")
+# 3. ACF
+acf(df$Weekly_Sales, main="Autocorrelation", na.action = na.pass)
+# 4. Holiday Effect
+plot(df$Date, df$Weekly_Sales, type="n", main="Holiday Effect", xlab="Date", ylab="Sales")
+points(df$Date[df$Holiday_Flag==0], df$Weekly_Sales[df$Holiday_Flag==0], col="gray", pch=16, cex=0.7)
+points(df$Date[df$Holiday_Flag==1], df$Weekly_Sales[df$Holiday_Flag==1], col="red", pch=16, cex=1.2)
+legend("topright", legend=c("Holiday", "Normal"), col=c("red", "gray"), pch=16, bty="n")})
+
+#--- Output: Decomposition Plot
+output$decomp_plot <- renderPlot({
+req(store_data_raw())
+# Prepare tsibble
+df_ts <- store_data_raw() %>%
+as_tsibble(index = Date) %>%
+fill_gaps() %>%
+mutate(Weekly_Sales = ifelse(is.na(Weekly_Sales), median(Weekly_Sales, na.rm = TRUE), Weekly_Sales))
+# Calculate STL
+dc_model <- df_ts %>%
+model(STL(Weekly_Sales ~ trend(window = 13) + season(window = "periodic"))) %>%
+components()
+autoplot(dc_model) +
+theme_minimal(base_size = 14) +
+labs(title = NULL)})
+
+#---Output: Correlation Plot
+output$corr_plot <- renderPlot({
+req(store_data_raw())
+df <- store_data_raw()
+# Convert to standard tibble for numeric selection
+df_num <- df %>%
+as_tibble() %>%
+select(where(is.numeric)) %>%
+select(any_of(c("Weekly_Sales", "Temperature", "Fuel_Price", "CPI", "Unemployment"))) %>%
+drop_na()
+if(ncol(df_num) > 1 && nrow(df_num) > 10) {
+M <- cor(df_num, use = "pairwise.complete.obs")
+corrplot(M,
+method="color",
+type="lower",
+addCoef.col="black",
+tl.col="black",
+tl.cex=1.2,       
+number.cex=1.2,    
+diag=FALSE,
+mar=c(0,0,1,0))}
+else {
+plot(1, type="n", axes=FALSE, xlab="", ylab="")
+text(1, 1, "Insufficient Data for Correlation", cex=1.5)}})}
+
+#========================================================
+# 6.RUN APP
+#========================================================
+shinyApp(ui, server)
+
+
+
