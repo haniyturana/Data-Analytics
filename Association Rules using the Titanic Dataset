@@ -1,0 +1,118 @@
+#########################################
+# ASSOCIATION RULE MINING - TITANIC DATA - in R
+#########################################
+
+# ---------------------------------------
+# 1. Load Data & Inspect
+# ---------------------------------------
+import pandas as pd
+
+titanic_raw = pd.read_csv("titanic.csv")  # adjust file if needed
+print("Head of data:\n", titanic_raw.head())
+print("Data info:\n", titanic_raw.info())
+
+# One-hot encoding for association rules
+titanic_onehot = pd.get_dummies(titanic_raw.astype(str))
+print("One-hot encoded sample:\n", titanic_onehot.head())
+
+# ---------------------------------------
+# 2. Load Required Libraries
+# ---------------------------------------
+from mlxtend.frequent_patterns import apriori, association_rules
+import matplotlib.pyplot as plt
+import networkx as nx
+from pandas.plotting import parallel_coordinates
+
+# ---------------------------------------
+# 3. Generate All Rules (S1)
+# ---------------------------------------
+frequent_itemsets_S1 = apriori(titanic_onehot, min_support=0.1, use_colnames=True)
+rules_S1 = association_rules(frequent_itemsets_S1, metric="confidence", min_threshold=0.6)
+rules_S1 = rules_S1.sort_values(by="confidence", ascending=False)
+
+print("Top 10 rules (S1):\n", rules_S1.head(10))
+
+# Visualization S1 - network graph
+G1 = nx.DiGraph()
+for _, row in rules_S1.iterrows():
+    for ant in row['antecedents']:
+        for con in row['consequents']:
+            G1.add_edge(ant, con, weight=row['confidence'])
+
+plt.figure(figsize=(10,10))
+pos = nx.spring_layout(G1, k=0.5, seed=42)
+nx.draw(G1, pos, with_labels=True, node_size=2000, node_color='skyblue', font_size=10, font_weight='bold', arrows=True)
+edge_labels = nx.get_edge_attributes(G1, 'weight')
+nx.draw_networkx_edge_labels(G1, pos, edge_labels={k: f"{v:.2f}" for k,v in edge_labels.items()})
+plt.show()
+
+# ---------------------------------------
+# 4. Rules for Survived = Yes (S2)
+# ---------------------------------------
+rules_S2 = rules_S1[rules_S1['consequents'].apply(lambda x: 'Survived_Yes' in x)]
+rules_S2 = rules_S2.sort_values(by='confidence', ascending=False)
+print("Rules for Survived=Yes (S2):\n", rules_S2)
+
+# Visualization S2
+G2 = nx.DiGraph()
+for _, row in rules_S2.iterrows():
+    for ant in row['antecedents']:
+        for con in row['consequents']:
+            G2.add_edge(ant, con, weight=row['confidence'])
+
+plt.figure(figsize=(10,10))
+pos = nx.spring_layout(G2, k=0.5, seed=42)
+nx.draw(G2, pos, with_labels=True, node_size=2000, node_color='lightgreen', font_size=10, font_weight='bold', arrows=True)
+edge_labels = nx.get_edge_attributes(G2, 'weight')
+nx.draw_networkx_edge_labels(G2, pos, edge_labels={k: f"{v:.2f}" for k,v in edge_labels.items()})
+plt.show()
+
+# ---------------------------------------
+# 5. Rules for Survival by Class & Age (S3)
+# LHS: Sex, Class, Age; RHS: Survived=Yes
+# ---------------------------------------
+allowed_lhs = [
+    'Sex_Male','Sex_Female',
+    'Class_1st','Class_2nd','Class_3rd',
+    'Age_Child','Age_Adult'
+]
+
+def lhs_valid(antecedents):
+    return all(item in allowed_lhs for item in antecedents)
+
+rules_S3 = rules_S2[rules_S2['antecedents'].apply(lhs_valid)]
+rules_S3 = rules_S3.sort_values(by='confidence', ascending=False)
+
+print("Rules S3 (Survival by Class & Age):\n", rules_S3)
+
+# Visualization S3 - network graph
+G3 = nx.DiGraph()
+for _, row in rules_S3.iterrows():
+    for ant in row['antecedents']:
+        for con in row['consequents']:
+            G3.add_edge(ant, con, weight=row['confidence'])
+
+plt.figure(figsize=(10,10))
+pos = nx.spring_layout(G3, k=0.5, seed=42)
+nx.draw(G3, pos, with_labels=True, node_size=2000, node_color='orange', font_size=10, font_weight='bold', arrows=True)
+edge_labels = nx.get_edge_attributes(G3, 'weight')
+nx.draw_networkx_edge_labels(G3, pos, edge_labels={k: f"{v:.2f}" for k,v in edge_labels.items()})
+plt.show()
+
+# Parallel coordinates plot for S3
+rules_plot = rules_S3.copy()
+rules_plot['antecedents_str'] = rules_plot['antecedents'].apply(lambda x: ','.join(list(x)))
+rules_plot['consequents_str'] = rules_plot['consequents'].apply(lambda x: ','.join(list(x)))
+
+parallel_coordinates(rules_plot[['antecedents_str','confidence']], 'antecedents_str', colormap=plt.get_cmap("Set2"))
+plt.xticks(rotation=90)
+plt.show()
+
+# ---------------------------------------
+# Notes:
+# - S1: All rules
+# - S2: Rules for Survived=Yes
+# - S3: Rules for Survival by Sex, Class & Age
+# - Support: fraction of transactions containing both LHS and RHS
+# - Confidence: likelihood that RHS occurs when LHS occurs
+# - Visualization helps detect patterns
