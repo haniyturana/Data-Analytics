@@ -1,5 +1,117 @@
+-----------------------------------------------------------------------------------------------------------------------
+R
+------------------------------------------------------------------------------------------------------------------------
 #########################################
-# ASSOCIATION RULE MINING - TITANIC DATA - in R
+# ASSOCIATION RULE MINING - TITANIC DATA
+#########################################
+
+# ---------------------------------------
+# 1. Load Data & Inspect
+# ---------------------------------------
+# List all objects loaded from .rdata file
+ls()
+
+# Look at first few rows of raw data
+head(titanic.raw)
+
+# Check structure of data
+str(titanic.raw)
+
+# Convert to transactions (required format for association rules)
+titanic_trans <- as(titanic.raw, "transactions")
+inspect(head(titanic_trans))
+
+# ---------------------------------------
+# 2. Descriptive Statistics of Transactions
+# ---------------------------------------
+# Summary statistics of transaction data
+summary(titanic_trans)
+
+# ---------------------------------------
+# 3. Generate Association Rules (Support & Confidence thresholds)
+# ---------------------------------------
+library(arules)
+library(arulesViz)
+
+# Create rules with minimum support = 0.1, confidence = 0.6
+Aturan.S1 <- apriori(titanic_trans, parameter = list(supp=0.1, conf=0.6))
+
+# View all rules
+inspect(Aturan.S1)
+
+# Sort rules by confidence (descending)
+Aturan.S1 <- sort(Aturan.S1, by="confidence", decreasing=TRUE)
+
+# View sorted rules
+inspect(head(Aturan.S1, 10))
+
+# ---------------------------------------
+# 4. Visualize Rules
+# ---------------------------------------
+# Node graph visualization
+plot(Aturan.S1, method="graph")
+
+# Parallel coordinates plot
+plot(Aturan.S1, method="paracoord", control=list(reorder=TRUE))
+
+# ---------------------------------------
+# 5. Rules for Individuals Who Survived (RHS = "Survived=Yes")
+# ---------------------------------------
+Aturan.S2 <- apriori(titanic_trans, 
+                     parameter=list(supp=0.1, conf=0.6),
+                     appearance=list(default="lhs", rhs="Survived=Yes"),
+                     control=list(verbose=FALSE))
+
+# Sort rules by confidence
+Aturan.S2 <- sort(Aturan.S2, by="confidence", decreasing=TRUE)
+
+# View rules
+inspect(Aturan.S2)
+
+# Visualization
+plot(Aturan.S2, method="graph")
+windows(10,10)
+plot(Aturan.S2, method="paracoord", control=list(reorder=TRUE))
+
+# ---------------------------------------
+# 6. Rules for Survival by Class & Age
+# ---------------------------------------
+# LHS: Sex, Class, Age; RHS: Survived=Yes
+Aturan.S3 <- apriori(titanic_trans,
+                     parameter=list(supp=0.01, conf=0.6),
+                     appearance=list(
+                       lhs=c("Sex=Male","Sex=Female","Class=1st","Class=2nd","Class=3rd",
+                             "Age=Child","Age=Adult"),
+                       rhs="Survived=Yes"),
+                     control=list(verbose=FALSE))
+
+# Sort rules by confidence
+Aturan.S3 <- sort(Aturan.S3, by="confidence", decreasing=TRUE)
+
+# View rules
+inspect(Aturan.S3)
+
+# Visualization
+plot(Aturan.S3, method="graph")
+windows(10,10)
+plot(Aturan.S3, method="paracoord", control=list(reorder=TRUE))
+
+# ---------------------------------------
+# Notes:
+# - "lhs" = Left-hand side (conditions)
+# - "rhs" = Right-hand side (consequent, outcome)
+# - Support: fraction of transactions containing both lhs and rhs
+# - Confidence: likelihood that rhs occurs when lhs occurs
+# - Use visualization to detect relationships and patterns
+# - Adjust support & confidence thresholds if too many/few rules
+
+
+------------------------------------------------------------------------------------------------------------------------
+PYTHON
+------------------------------------------------------------------------------------------------------------------------
+
+#########################################
+# ASSOCIATION RULE MINING - TITANIC DATA - in Python
 #########################################
 
 # ---------------------------------------
